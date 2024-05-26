@@ -3,10 +3,10 @@ Creating a diffusion model from scratch in PyTorch and training it for denoising
 
 
 ## TODO List
-- [ ] Implement the diffusion model in PyTorch.
-- [ ] Implement the training loop.
+- [x] Implement the diffusion model in PyTorch.
+- [x] Implement the training loop.
+- [ ] Overfit on the Cornell Box dataset generated using mitusba.
 - [ ] Improve speed using https://github.com/hutaiHang/Faster-Diffusion
-- [ ] Test using mitsuba renderings.
 - [ ] https://arxiv.org/html/2307.03992v3/#S5 Diffusion for General Denoising
 
 ## References

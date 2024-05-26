@@ -41,5 +41,11 @@ def sigmoid_beta_scheduler(num_timesteps, beta_start=1e-4, beta_end=0.02):
     return torch.sigmoid(betas) * (beta_end - beta_start) + beta_start
 
 
-def positional_embedding(x, dim, theta):
-    pass
+def normalize(img: torch.Tensor) -> torch.Tensor:
+    """Normalize the image tensor."""
+    return img * 2 - 1
+
+
+def denormalize(img: torch.Tensor) -> torch.Tensor:
+    """Denormalize the image tensor."""
+    return (img + 1) / 2
