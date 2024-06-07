@@ -17,7 +17,7 @@ def beta_scheduler_factory(beta_type, num_timesteps, **kwargs):
 
 def linear_beta_scheduler(num_timesteps, beta_start=1e-4, beta_end=0.02):
     """Returns a linear beta scheduler for the diffusion model."""
-    return torch.linspace(beta_start, beta_end, num_timesteps)
+    return torch.linspace(beta_start, beta_end, num_timesteps + 1)
 
 
 def quadratic_beta_scheduler(num_timesteps, beta_start=1e-4, beta_end=0.02):
