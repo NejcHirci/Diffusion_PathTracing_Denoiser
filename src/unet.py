@@ -11,6 +11,8 @@ class DiffusionUNet(nn.Module):
     def __init__(self, im_channels, init_dim=None, dim_mults=(1, 2, 2, 4), has_attn=(False, False, True, True), theta=10000):
         super(DiffusionUNet, self).__init__()
 
+        self.has_attn = has_attn
+        self.dim_mults = dim_mults
         self.n_resolutions = len(dim_mults)
         self.channels = im_channels
         self.init_dim = init_dim if init_dim else im_channels
@@ -27,10 +29,10 @@ class DiffusionUNet(nn.Module):
         # First-half of the U-Net where channels are increasing and resolutions are decreasing
         self.downs = nn.ModuleList([nn.ModuleList([
             # First Block
-            ResBlock(dim_in, dim_in, time_channels=time_dim),
+            ResBlock(dim_in, dim_in, n_groups=self.init_dim, time_channels=time_dim),
             AttentionBlock(dim_in) if has_attn[i] else nn.Identity(),
-            # Second Block
-            ResBlock(dim_in, dim_out, time_channels=time_dim),
+            # Second Block (change channel resolution)
+            ResBlock(dim_in, dim_out, n_groups=self.init_dim, time_channels=time_dim),
             AttentionBlock(dim_out) if has_attn[i] else nn.Identity(),
             # Downsample if not the last block
             Downsample(dim_out) if i < self.n_resolutions - 1 else nn.Identity()])
@@ -38,29 +40,29 @@ class DiffusionUNet(nn.Module):
 
         # Bottleneck in the middle
         mid_dim = dims[-1]
-        self.mids_0 = ResBlock(mid_dim, mid_dim, time_channels=time_dim)
+        self.mids_0 = ResBlock(mid_dim, mid_dim, n_groups=self.init_dim, time_channels=time_dim)
         self.mid_attn = AttentionBlock(mid_dim)
-        self.mids_1 = ResBlock(mid_dim, mid_dim, time_channels=time_dim)
+        self.mids_1 = ResBlock(mid_dim, mid_dim, n_groups=self.init_dim, time_channels=time_dim)
 
         # Second-half of the U-Net where channels are decreasing and resolutions are increasing
         self.ups = nn.ModuleList([nn.ModuleList([
             # First Block
-            ResBlock(dim_out + dim_out, dim_out, time_channels=time_dim),
-            AttentionBlock(dim_out) if has_attn[-i-1] else nn.Identity(),
-            # Second Block
-            ResBlock(dim_in + dim_out, dim_in, time_channels=time_dim),
-            AttentionBlock(dim_in) if has_attn[-i-1] else nn.Identity(),
-            # Final Block to Reduce Channel count
-            ResBlock(dim_in + dim_in, dim_in, time_channels=time_dim),
-            AttentionBlock(dim_in) if has_attn[-i-1] else nn.Identity(),
+            ResBlock(high_dim + high_dim, high_dim, n_groups=self.init_dim, time_channels=time_dim),
+            AttentionBlock(high_dim) if has_attn[-i-1] else nn.Identity(),
+            # Second Block (change channel resolution)
+            ResBlock(low_dim + high_dim, low_dim, n_groups=self.init_dim, time_channels=time_dim),
+            AttentionBlock(low_dim) if has_attn[-i-1] else nn.Identity(),
+            # Final Block
+            ResBlock(low_dim + low_dim, low_dim, n_groups=self.init_dim, time_channels=time_dim),
+            AttentionBlock(low_dim) if has_attn[-i-1] else nn.Identity(),
             # Upsample if not the last block
-            Upsample(dim_in) if i < self.n_resolutions - 1 else nn.Identity()
-        ]) for i, (dim_in, dim_out) in enumerate(in_out[::-1])])
+            Upsample(low_dim) if i < self.n_resolutions - 1 else nn.Identity()
+        ]) for i, (low_dim, high_dim) in enumerate(in_out[::-1])])
 
         # Final normalization and convolution layers
         self.final_norm = nn.GroupNorm(8, dim)
         self.final_act = Swish()
-        self.final_conv = nn.Conv2d(dim, im_channels, 3, padding=1)
+        self.final_conv = nn.Conv2d(dim, self.channels, 3, padding=1)
 
     def forward(self, x, time):
         # Get Time Embeding to be added to all
@@ -69,14 +71,14 @@ class DiffusionUNet(nn.Module):
 
         unet_stack = [x]
         # First Half of the U-Net
-        for res1, attn1, res2, attn2, downsample in self.downs:
+        for res, attn, res_change, attn_change, downsample in self.downs:
             # Block 1
-            x = res1(x, t)
-            x = attn1(x)
+            x = res(x, t)
+            x = attn(x)
             unet_stack.append(x)
             # Block 2
-            x = res2(x, t)
-            x = attn2(x)
+            x = res_change(x, t)
+            x = attn_change(x)
             unet_stack.append(x)
             if isinstance(downsample, Downsample):
                 x = downsample(x)
@@ -87,7 +89,7 @@ class DiffusionUNet(nn.Module):
         x = self.mid_attn(x)
         x = self.mids_1(x, t)
 
-        for res1, attn1, res2, attn2, final_res, final_attn, upsample in self.ups:
+        for res1, attn1, res2, attn2, res3, attn3, upsample in self.ups:
             # Block 1
             x = torch.cat((x, unet_stack.pop()), dim=1)
             x = res1(x, t)
@@ -96,10 +98,10 @@ class DiffusionUNet(nn.Module):
             x = torch.cat((x, unet_stack.pop()), dim=1)
             x = res2(x, t)
             x = attn2(x)
-            # Final Block
+            # Block 3
             x = torch.cat((x, unet_stack.pop()), dim=1)
-            x = final_res(x, t)
-            x = final_attn(x)
+            x = res3(x, t)
+            x = attn3(x)
             x = upsample(x)
 
         x = self.final_norm(x)
@@ -107,6 +109,77 @@ class DiffusionUNet(nn.Module):
         return self.final_conv(x)
 
 
+# A Lite U-Net
+class DiffusionUNetLite(DiffusionUNet):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        has_attn = self.has_attn
+        dim = self.init_dim
+        dims = [self.init_dim, *map(lambda m: dim * m, self.dim_mults)]
+        in_out = list(zip(dims[:-1], dims[1:]))
+        time_dim = dim * 4
+
+        # First-half of the U-Net where channels are increasing and resolutions are decreasing
+        self.downs = nn.ModuleList([nn.ModuleList([
+            # Block
+            ResBlock(dim_in, dim_out, n_groups=self.init_dim, time_channels=time_dim),
+            AttentionBlock(dim_out) if has_attn[i] else nn.Identity(),
+            # Downsample if not the last block
+            Downsample(dim_out) if i < self.n_resolutions - 1 else nn.Identity()])
+            for i, (dim_in, dim_out) in enumerate(in_out)])
+
+        # Bottleneck in the middle
+        mid_dim = dims[-1]
+        self.mids_0 = ResBlock(mid_dim, mid_dim, n_groups=self.init_dim, time_channels=time_dim)
+        self.mid_attn = AttentionBlock(mid_dim)
+        self.mids_1 = ResBlock(mid_dim, mid_dim, n_groups=self.init_dim, time_channels=time_dim)
+
+        # Second-half of the U-Net where channels are decreasing and resolutions are increasing
+        self.ups = nn.ModuleList([nn.ModuleList([
+            ResBlock(dim_out + dim_out, dim_in, n_groups=self.init_dim, time_channels=time_dim),
+            AttentionBlock(dim_in) if has_attn[-i - 1] else nn.Identity(),
+            # Upsample if not the last block
+            Upsample(dim_in) if i < self.n_resolutions - 1 else nn.Identity()
+        ]) for i, (dim_in, dim_out) in enumerate(in_out[::-1])])
+
+        # Final normalization and convolution layers
+        self.final_norm = nn.GroupNorm(8, dim)
+        self.final_act = Swish()
+        self.final_conv = nn.Conv2d(dim, self.channels, 3, padding=1)
+
+    def forward(self, x, time):
+        # Get Time Embeding to be added to all
+        t = self.time_mlp(time)
+        x = self.in_conv(x)
+
+        unet_stack = [x]
+        # First Half of the U-Net
+        for res1, attn1, downsample in self.downs:
+            # Block 1
+            x = res1(x, t)
+            x = attn1(x)
+            unet_stack.append(x)
+            if isinstance(downsample, Downsample):
+                x = downsample(x)
+
+        # Midlle of the U-Net
+        x = self.mids_0(x, t)
+        x = self.mid_attn(x)
+        x = self.mids_1(x, t)
+
+        for res1, attn1, upsample in self.ups:
+            # Block 1
+            x = torch.cat((x, unet_stack.pop()), dim=1)
+            x = res1(x, t)
+            x = attn1(x)
+            x = upsample(x)
+
+        x = self.final_norm(x)
+        x = self.final_act(x)
+        return self.final_conv(x)
+
+# A Residual Block
 class ResBlock(nn.Module):
     def __init__(self, in_channels, out_channels, time_channels, n_groups=32, dropout=0.1):
         super(ResBlock, self).__init__()
@@ -124,14 +197,16 @@ class ResBlock(nn.Module):
 
         self.time_emb = nn.Linear(time_channels, out_channels)
         self.time_act = Swish()
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x, t):
-        h = self.conv1(self.act1(self.norm1(x)))
-
+        # h = self.norm1(x)
+        h = self.act1(x)
+        h = self.conv1(h)
         h = h + self.time_emb(self.time_act(t))[:, :, None, None]
-
-        h = self.conv2(self.act2(self.norm2(h)))
-
+        h = self.norm2(h)
+        h = self.act2(h)
+        h = self.dropout(self.act2(h))
         return h + self.shortcut(x)
 
 

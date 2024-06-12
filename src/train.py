@@ -1,15 +1,13 @@
 import glob
+import sys
+import logging
+
 import cv2
 import numpy as np
 import torch
-import torchvision
-import torchvision.transforms as transforms
 import matplotlib.pyplot as plt
-import matplotlib
-import os
+from torchvision.transforms import v2
 
-from skimage import io
-from model import DiffusionModel
 from model_alternative import DiffusionModelForDenoising
 from tqdm import tqdm
 
@@ -19,27 +17,49 @@ from tqdm import tqdm
 class RenderingsDataset(torch.utils.data.Dataset):
     """Renderings dataset."""
 
-    def __init__(self, res=(256, 256), scene_name="cbox"):
+    def __init__(self, res=(256, 256), scene_name="all", spp=None):
         """
         Args:
             root_dir (string): Directory with all the renderings.
             transform (callable, optional): Optional transform to be applied
                 on a sample.
         """
-        self.all_images = sorted(glob.glob(f"../data/{scene_name}/train_*"))
-        self.images = self.all_images
         self.resize_shape = res
-        self.gt_image = self.transform_image(f"../data/{scene_name}/gt.png")
-
         self.data = []
-        self.load_images()
+        self.load_images(scene_name=scene_name, spp=spp)
+        self.transforms = v2.Compose([v2.RandomHorizontalFlip(0.5), v2.RandomVerticalFlip(0.5)])
+        self.scene_name = scene_name
 
     def __len__(self):
-        return len(self.images)
+        return len(self.data)
 
-    def load_images(self):
-        for i in range(len(self.images)):
-            self.data.append(self.transform_image(self.images[i]))
+    def load_images(self, scene_name="cbox", spp=None):
+        if scene_name == "all":
+            scenes = ["bathroom", "kitchen", "cbox", "veach_ajar", "veach_bidir"]
+            for i in scenes:
+                images = sorted(glob.glob(f"../data/{i}/train_*"))
+                gt_image = self.transform_image(f"../data/{i}/gt.png")
+                for i in range(len(images)):
+                    sample = (self.transform_image(images[i]), gt_image)
+                    self.data.append(sample)
+        elif scene_name == "all_diff_views" or scene_name == "test":
+            scenes = ["bathroom_novel", "kitchen_novel", "veach_ajar_novel", "veach_bidir_novel", "house_novel",
+                      "living_room_novel", "cbox_novel"]
+            view_ind = range(0, 7, 1) if scene_name == "all_diff_views" else [7]
+            spp_set = [1, 2, 4, 8, 16, 32, 64, 128] if spp is None else [spp]
+            for spp in spp_set:
+                for noise in range(8):
+                    for view in view_ind:
+                        for scene in scenes:
+                            gt_image = self.transform_image(f"../data/{scene}/gt_{view}.png")
+                            image = self.transform_image(f"../data/{scene}/train_{noise}_{view}_{spp}.png")
+                            self.data.append((image, gt_image))
+        else:
+            images = sorted(glob.glob(f"../data/{scene_name}/train_*"))
+            gt_image = self.transform_image(f"../data/{scene_name}/gt.png")
+            for i in range(len(images)):
+                sample = (self.transform_image(images[i]), gt_image)
+                self.data.append(sample)
 
     def transform_image(self, image_path):
         channels = 3
@@ -53,9 +73,8 @@ class RenderingsDataset(torch.utils.data.Dataset):
         return image
 
     def __getitem__(self, idx):
-        image = self.data[idx]
-        sample = (image, idx)
-        return sample
+        image, gt_image = self.data[idx]
+        return image, gt_image
 
 
 def evaluate(model, data_loader, device):
@@ -68,7 +87,7 @@ def evaluate(model, data_loader, device):
         print(f"Batch {i} Loss: {loss.item()}")
 
 
-def train(model, data_loader, epochs=1000, lr=1e-3, device=torch.device("cpu"), gt_image=None):
+def train(model, data_loader, epochs=1000, lr=1e-3, device=torch.device("cpu"), scene_name="cbox", save_model=True, test_loader=None):
     # Move the model to the device
     model.to(device)
     model.train()
@@ -81,40 +100,42 @@ def train(model, data_loader, epochs=1000, lr=1e-3, device=torch.device("cpu"), 
     # We add an empircal regularization loss term
     loss_reg = 0.001
 
-    if gt_image is not None:
-        gt_image = gt_image.unsqueeze(0).repeat(data_loader.batch_size, 1, 1, 1).to(device)
+    # lr_scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.95)
 
     for epoch in range(epochs):
         epoch_loss = 0
-        with tqdm(data_loader, unit="batch") as train_epoch:
+        with tqdm(data_loader, unit="batch", file=sys.stdout) as train_epoch:
             train_epoch.set_description(f"Epoch {epoch}")
-            for images, labels in train_epoch:
+            for x_data, y_gt in train_epoch:
                 optimizer.zero_grad()
-                images = images.cuda()
-                if gt_image is not None:
-                    pred_gt, _ = model(images, gt_image)
-                    loss = torch.sqrt(criterion(pred_gt, gt_image) + loss_reg ** 2)
-                else:
-                    noisy_x, noise, noise_pred = model(images)
-                    loss = criterion(noise_pred, noise)
-
+                x_data = x_data.cuda()
+                y_gt = y_gt.cuda()
+                pred_gt, _ = model(x_data, y_gt)
+                loss = torch.sqrt(criterion(pred_gt, y_gt) + loss_reg ** 2)
                 loss.backward()
                 optimizer.step()
-
                 epoch_loss += loss.item()
                 train_epoch.set_postfix({"Batch Noise Loss": loss.item(), "Epoch Noise Loss": epoch_loss})
-
-            if epoch % 50 == 0:
-                if gt_image is not None:
-                    evaluate_special(model, images)
-                else:
-                    evaluate(model, data_loader, device)
+            logging.info(f"Epoch {epoch} Batch Noise Loss: {loss.item()} Epoch Loss: {epoch_loss}")
+            # lr_scheduler.step()
+            # Evaluate model on small sample from test set
+            if test_loader:
+                logging.info(f"Epoch {epoch}: Evaluating model on test set...")
+                model.eval()
+                evaluate_model(model, test_loader)
                 model.train()
+            else:
+                # Else just observe results
+                evaluate_special(model, x_data)
+            model.train()
 
-    print(f"Training complete! {epochs} epochs completed.")
+    # Evaluate the model
+    evaluate_special(model, x_data)
+    logging.info(f"Training complete! {epochs} epochs completed.")
     # Save the model
-    print("Saving the model...")
-    torch.save(model.state_dict(), f"../results/diffusion_model_special2_cbox_final.pth")
+    if save_model:
+        logging.info("Saving the final model...")
+        torch.save(model.state_dict(), f"../results/{folder}/weights.pth")
 
 
 def forward_diffusion_test(model, train_loader):
@@ -139,7 +160,7 @@ def forward_diffusion_test(model, train_loader):
         plt.show()
 
 
-def evaluate_special(model, x_real):
+def evaluate_special(model, x_real, save_fig=False, name=""):
     model.eval()
     with torch.no_grad():
         generated_image = model.sample(x_real)
@@ -151,14 +172,19 @@ def evaluate_special(model, x_real):
         plt.figure(figsize=(images.shape[1] / 300, images.shape[0] / 300), dpi=300)
         plt.imshow(images)
         plt.axis("off")
-        plt.show()
+        if save_fig:
+            plt.savefig(f"../results/{folder}/{name}")
+            plt.close()
+        else:
+            plt.show()
+            plt.close()
 
 
-def evaluate_model(model):
+def evaluate_model_basic(model, num_samples=3):
     model.eval()
     with torch.no_grad():
         # Perform sampling for 3 images
-        generated_images = model.sample(3)
+        generated_images = model.sample(num_samples)
         # Concatenate and display the image with pyplot
         # N, C, H, W -> N, H, W, C
         generated_images = generated_images.permute(0, 2, 3, 1).cpu().numpy()
@@ -169,36 +195,59 @@ def evaluate_model(model):
         plt.show()
 
 
+def evaluate_model(model, test_loader):
+    model.eval()
+    with torch.no_grad():
+        total_test_loss = 0
+        for x_data, y_gt in test_loader:
+            x_data = x_data.cuda()
+            y_gt = y_gt.cuda()
+            pred_gt, _ = model(x_data, y_gt)
+            loss = torch.nn.functional.mse_loss(pred_gt, y_gt)
+            total_test_loss += loss.item()
+        logging.info(f"Test Loss: {total_test_loss}")
+
+
 if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     data_path = "../data"
-    dataset = "cbox"
+    dataset = "all_diff_views"
     res = (256, 256)
     img_channels = 3
 
+    folder = "../results/train_all_novel_lite"
+
+    logging.basicConfig(level=logging.INFO,
+                        filename=f"../results/{folder}/output.log",
+                        format="%(asctime)s - %(levelname)s - %(message)s",
+                        filemode="a+")
+
+    console = logging.StreamHandler()
+    console.setLevel(logging.INFO)
+    logging.getLogger("").addHandler(console)
+
     # Diffusion Model Parameters
     n_timesteps = 70
-    train_batch_size = 4
-    test_batch_size = 4
-    lr = 1e-6
-    epochs = 500
+    train_batch_size = 8
+    test_batch_size = 8
+    lr = 5e-6
+    epochs = 100
 
     seed = 42
     torch.manual_seed(seed)
     np.random.seed(seed)
 
-    train_dataset = RenderingsDataset(res=res, scene_name="cbox")
-    gt_image = train_dataset.gt_image
-    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=train_batch_size, shuffle=True, num_workers=1, pin_memory=False)
+    train_dataset = RenderingsDataset(res=res, scene_name=dataset)
+    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=train_batch_size, shuffle=True, num_workers=2, pin_memory=True)
+
+    test_dataset = RenderingsDataset(res=res, scene_name="test")
+    test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=test_batch_size,  shuffle=False, num_workers=0, pin_memory=False)
 
     # Let's continue training the model
     #model = DiffusionModel(res, img_channels, num_timesteps=n_timesteps, scheduler="linear")
-    #model.load_state_dict(torch.load("../results/diffusion_model_diffunet_cbox_final.pth"))
-    print(torch.cuda.memory.mem_get_info())
-    model = DiffusionModelForDenoising(res, img_channels, num_timesteps=n_timesteps, scheduler="linear")
-    print(torch.cuda.memory.mem_get_info())
+    model = DiffusionModelForDenoising(res, img_channels, num_timesteps=n_timesteps, scheduler="linear", in_dim=32, dim_mults=(1, 2, 4, 8), mode="lite")
+    #model.load_state_dict(torch.load("../results/train_all_novel_lite_final/weights.pth"))
     model.to(device)
 
-    train(model, train_loader, epochs, lr, device, gt_image=gt_image)
-
-    evaluate_model(model)
+    train(model, train_loader, epochs, lr, device, scene_name=dataset, test_loader=test_loader)
+    #evaluate_model(model, test_loader)
