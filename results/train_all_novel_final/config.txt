@@ -1,6 +1,6 @@
 n_timesteps = 70
 train_batch_size = 8
 test_batch_size = 8
-lr = 5e-6 constant
+lr = 1e-4 with Exponential LR 0.95
 epochs = 100
-DiffNet with (1,2,4,8) and 64 input dim
+DiffNet with (1,2,2,4) and 32 input dim
